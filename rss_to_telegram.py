@@ -19,10 +19,9 @@ import xml.etree.ElementTree as ET
 # RSS manbalar ro'yxati - bu yerga xohlagan saytlaringizning RSS havolasini qo'shing
 # (o'zbekcha ham, chet el (ingliz/rus va h.k.) saytlar ham bo'lishi mumkin)
 FEEDS = [
-    # Misol uchun (o'zingiz tekshirib, to'g'ri RSS havolasini qo'ying):
-    # "https://kun.uz/uz/rss",
-    # "https://www.gazeta.uz/uz/rss/",
-    # "https://www.reuters.com/world/rss",   # chet el manbasiga misol
+    "http://feeds.bbci.co.uk/sport/football/rss.xml",
+    "https://www.skysports.com/rss/11095",
+    "https://www.espn.com/espn/rss/soccer/news",
 ]
 
 # Har bir ishga tushishda nechta yangi xabar joylash mumkinligi (spam bo'lmasligi uchun)
