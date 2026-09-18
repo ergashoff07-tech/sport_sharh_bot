@@ -2,17 +2,19 @@
 RSS -> Telegram kanal avtomatik post qiluvchi skript.
 
 Ishlash tartibi:
-1. FEEDS ro'yxatidagi manbalarni navbat bilan (galma-gal) tekshiradi.
-2. Har bir ishga tushishda faqat 1 ta YANGI xabar joylaydi (spam bo'lmasligi uchun);
-   keyingi xabar workflow jadvali bo'yicha (masalan 10 daqiqadan keyin) joylanadi.
-3. Agar xabarda rasm bo'lsa, uni ham birga yuboradi (rasm + sarlavha + qisqacha matn).
-4. Manba havolasi (link) postga QO'SHILMAYDI.
-5. posted.json - qaysi xabarlar joylanganini, state.json - navbatda qaysi manba
-   ekanini eslab qoladi (GitHub Actions bu fayllarni commit qilib qo'yadi).
+1. Har 5 daqiqada barcha FEEDS manbalarini tekshiradi (haqiqiy vaqtga eng yaqin,
+   bepul avtomatika uchun texnik jihatdan eng tez mumkin bo'lgan oraliq).
+2. Agar bir nechta manba BIR XIL voqea haqida yozgan bo'lsa (sarlavhalar o'xshash),
+   ularni bitta post sifatida qabul qiladi va faqat BIR MARTA joylaydi.
+3. Har bir ishga tushishda faqat 1 ta yangi (yoki birlashtirilgan) voqeani joylaydi.
+4. Rasm bo'lsa - rasm bilan, matnni iqtibos (quote) blokida chiroyli formatlab yuboradi.
+5. Manba havolasi postga qo'shilmaydi.
 """
 
 import os
+import re
 import json
+import difflib
 import hashlib
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -26,6 +28,9 @@ FEEDS = [
 
 TRANSLATE_MODE = "google"   # "off" / "google" / "claude"
 TARGET_LANGUAGE = "uz"
+
+# Ikki sarlavha shuncha foiz o'xshash bo'lsa - "bir xil voqea" deb hisoblanadi
+SIMILARITY_THRESHOLD = 0.55
 
 BASE_DIR = os.path.dirname(__file__)
 POSTED_FILE = os.path.join(BASE_DIR, "posted.json")
@@ -66,6 +71,17 @@ def item_id(link, title):
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
+def normalize_title(t):
+    t = t.lower()
+    t = re.sub(r"[^\w\s]", "", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def is_similar(t1, t2):
+    return difflib.SequenceMatcher(None, normalize_title(t1), normalize_title(t2)).ratio() >= SIMILARITY_THRESHOLD
+
+
 def fetch_feed_items(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
@@ -98,7 +114,6 @@ def fetch_feed_items(url):
 
 
 def clean_html(text):
-    import re
     text = re.sub("<[^<]+?>", "", text)
     return text.strip()
 
@@ -167,14 +182,15 @@ def _telegram_api(method, payload):
 
 
 def build_caption(title, description, limit):
-    text = f"<b>{title}</b>"
+    head = f"⚽️ <b>{title}</b>"
     desc = clean_html(description)
+    text = head
     if desc:
-        room = limit - len(text) - 4
+        room = limit - len(head) - len("\n\n<blockquote></blockquote>") - 4
         if room > 20:
             if len(desc) > room:
                 desc = desc[:room].rsplit(" ", 1)[0] + "..."
-            text += f"\n\n{desc}"
+            text += f"\n\n<blockquote>{desc}</blockquote>"
     return text
 
 
@@ -213,7 +229,7 @@ def main():
     n = len(FEEDS)
     start_idx = state.get("next_feed_index", 0) % n
 
-    sent = False
+    all_pending = []
     for offset in range(n):
         idx = (start_idx + offset) % n
         feed_url = FEEDS[idx]
@@ -222,29 +238,49 @@ def main():
         except Exception as e:
             print(f"[XATO] {feed_url} dan o'qib bo'lmadi: {e}")
             continue
-
         for it in reversed(items):
             uid = item_id(it["link"], it["title"])
-            if uid in posted:
-                continue
-            try:
-                title = translate(it["title"])
-                description = translate(clean_html(it["description"]))
-                send_to_telegram(title, description, it["image"])
-                posted.add(uid)
-                print(f"[OK] Yuborildi ({feed_url}): {title}")
-                sent = True
-            except Exception as e:
-                print(f"[XATO] Yuborib bo'lmadi ({it['title']}): {e}")
-            break
-        if sent:
-            state["next_feed_index"] = (idx + 1) % n
-            break
+            if uid not in posted:
+                it2 = dict(it)
+                it2["uid"] = uid
+                it2["feed_idx"] = idx
+                all_pending.append(it2)
 
-    if not sent:
+    if not all_pending:
         print("Yangi xabar topilmadi.")
         state["next_feed_index"] = (start_idx + 1) % n
+        save_state(state)
+        return
 
+    anchor = all_pending[0]
+
+    cluster = [anchor]
+    for it in all_pending[1:]:
+        if is_similar(it["title"], anchor["title"]):
+            cluster.append(it)
+
+    chosen_image = anchor.get("image")
+    if not chosen_image:
+        for it in cluster:
+            if it.get("image"):
+                chosen_image = it["image"]
+                break
+
+    try:
+        title = translate(anchor["title"])
+        description = translate(clean_html(anchor["description"]))
+        send_to_telegram(title, description, chosen_image)
+        print(f"[OK] Yuborildi: {title}  (bu voqeani {len(cluster)} ta manba yozgan edi)")
+    except Exception as e:
+        print(f"[XATO] Yuborib bo'lmadi: {e}")
+        state["next_feed_index"] = (start_idx + 1) % n
+        save_state(state)
+        return
+
+    for it in cluster:
+        posted.add(it["uid"])
+
+    state["next_feed_index"] = (anchor["feed_idx"] + 1) % n
     save_posted(posted)
     save_state(state)
 
