@@ -29,7 +29,6 @@ FEEDS = [
 TRANSLATE_MODE = "google"   # "off" / "google" / "claude"
 TARGET_LANGUAGE = "uz"
 
-# Ikki sarlavha shuncha foiz o'xshash bo'lsa - "bir xil voqea" deb hisoblanadi
 SIMILARITY_THRESHOLD = 0.55
 
 BASE_DIR = os.path.dirname(__file__)
@@ -121,8 +120,12 @@ def clean_html(text):
 def translate_with_google(text):
     if not text:
         return text
-    from deep_translator import GoogleTranslator
-    return GoogleTranslator(source="auto", target=TARGET_LANGUAGE).translate(text)
+    from deep_translator import GoogleTranslator, MyMemoryTranslator
+    try:
+        return GoogleTranslator(source="auto", target=TARGET_LANGUAGE).translate(text)
+    except Exception as e:
+        print(f"[OGOHLANTIRISH] Google tarjimasi ishlamadi, MyMemory sinalmoqda: {e}")
+        return MyMemoryTranslator(source="en-GB", target="uz-UZ").translate(text)
 
 
 def translate_with_claude(text):
