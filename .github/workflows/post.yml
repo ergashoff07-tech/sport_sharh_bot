@@ -2,7 +2,7 @@ name: RSS -> Telegram
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -29,10 +29,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python rss_to_telegram.py
 
-      - name: posted.json o'zgarishini saqlash
+      - name: Holatni saqlash
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
-          git add posted.json
-          git diff --cached --quiet || git commit -m "posted.json yangilandi"
+          git add posted.json state.json
+          git diff --cached --quiet || git commit -m "holat yangilandi"
           git push
