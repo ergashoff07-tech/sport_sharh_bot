@@ -2,44 +2,38 @@
 RSS -> Telegram kanal avtomatik post qiluvchi skript.
 
 Ishlash tartibi:
-1. config.py (yoki FEEDS o'zgaruvchisi) da ko'rsatilgan RSS manbalarni o'qiydi.
-2. posted.json faylida oldin joylangan xabarlar ro'yxatini saqlaydi (takrorlanmasligi uchun).
-3. Yangi (hali joylanmagan) har bir yangilikni Telegram kanalga yuboradi.
-4. posted.json faylini yangilaydi (GitHub Actions bu faylni commit qilib qo'yadi).
+1. FEEDS ro'yxatidagi manbalarni navbat bilan (galma-gal) tekshiradi.
+2. Har bir ishga tushishda faqat 1 ta YANGI xabar joylaydi (spam bo'lmasligi uchun);
+   keyingi xabar workflow jadvali bo'yicha (masalan 10 daqiqadan keyin) joylanadi.
+3. Agar xabarda rasm bo'lsa, uni ham birga yuboradi (rasm + sarlavha + qisqacha matn).
+4. Manba havolasi (link) postga QO'SHILMAYDI.
+5. posted.json - qaysi xabarlar joylanganini, state.json - navbatda qaysi manba
+   ekanini eslab qoladi (GitHub Actions bu fayllarni commit qilib qo'yadi).
 """
 
 import os
 import json
-import time
 import hashlib
 import urllib.request
 import xml.etree.ElementTree as ET
 
 # ============ SOZLAMALAR ============
-# RSS manbalar ro'yxati - bu yerga xohlagan saytlaringizning RSS havolasini qo'shing
-# (o'zbekcha ham, chet el (ingliz/rus va h.k.) saytlar ham bo'lishi mumkin)
 FEEDS = [
     "http://feeds.bbci.co.uk/sport/football/rss.xml",
     "https://www.skysports.com/rss/11095",
     "https://www.espn.com/espn/rss/soccer/news",
 ]
 
-# Har bir ishga tushishda nechta yangi xabar joylash mumkinligi (spam bo'lmasligi uchun)
-MAX_POSTS_PER_RUN = 5
+TRANSLATE_MODE = "google"   # "off" / "google" / "claude"
+TARGET_LANGUAGE = "uz"
 
-# Tarjima sozlamalari:
-#   "off"    -> tarjima qilinmaydi, asl tildagicha joylanadi
-#   "google" -> bepul, tez, sifat o'rtacha (internetga bog'liq, ba'zan bloklanishi mumkin)
-#   "claude" -> Anthropic Claude API orqali tarjima (sifatli, lekin ANTHROPIC_API_KEY kerak)
-TRANSLATE_MODE = "google"
-TARGET_LANGUAGE = "uz"  # o'zbekcha
+BASE_DIR = os.path.dirname(__file__)
+POSTED_FILE = os.path.join(BASE_DIR, "posted.json")
+STATE_FILE = os.path.join(BASE_DIR, "state.json")
 
-POSTED_FILE = os.path.join(os.path.dirname(__file__), "posted.json")
-
-# Telegram ma'lumotlari GitHub Secrets orqali keladi (pastga qarang)
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # masalan: @mening_kanalim yoki -1001234567890
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # faqat TRANSLATE_MODE="claude" bo'lsa kerak
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 
 def load_posted():
@@ -50,14 +44,24 @@ def load_posted():
 
 
 def save_posted(posted_set):
-    # faylni cheksiz o'sishdan saqlash uchun oxirgi 2000 tasini qoldiramiz
-    trimmed = list(posted_set)[-2000:]
+    trimmed = list(posted_set)[-3000:]
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
         json.dump(trimmed, f, ensure_ascii=False, indent=2)
 
 
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"next_feed_index": 0}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
 def item_id(link, title):
-    # link asosiy identifikator, bo'lmasa title dan hash yasaymiz
     base = link or title
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
@@ -68,17 +72,32 @@ def fetch_feed_items(url):
         data = resp.read()
     root = ET.fromstring(data)
     items = []
-    # RSS 2.0 format: channel/item
     for item in root.findall(".//item"):
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
         description = (item.findtext("description") or "").strip()
-        items.append({"title": title, "link": link, "description": description})
+
+        image_url = None
+        enclosure = item.find("enclosure")
+        if enclosure is not None and enclosure.get("type", "").startswith("image"):
+            image_url = enclosure.get("url")
+        if not image_url:
+            for child in item:
+                tag = child.tag.split("}")[-1]
+                if tag in ("content", "thumbnail") and child.get("url"):
+                    image_url = child.get("url")
+                    break
+
+        items.append({
+            "title": title,
+            "link": link,
+            "description": description,
+            "image": image_url,
+        })
     return items
 
 
 def clean_html(text):
-    # description ichidagi oddiy HTML teglarni olib tashlaymiz
     import re
     text = re.sub("<[^<]+?>", "", text)
     return text.strip()
@@ -100,20 +119,17 @@ def translate_with_claude(text):
     payload = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 1000,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "Quyidagi matnni o'zbek tiliga (lotin alifbosida) tabiiy va ravon "
-                    "tarjima qil. Faqat tarjimani qaytar, boshqa hech narsa yozma:\n\n" + text
-                ),
-            }
-        ],
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Quyidagi matnni o'zbek tiliga (lotin alifbosida) tabiiy va ravon "
+                "tarjima qil. Faqat tarjimani qaytar, boshqa hech narsa yozma:\n\n" + text
+            ),
+        }],
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        api_url,
-        data=data,
+        api_url, data=data,
         headers={
             "Content-Type": "application/json",
             "x-api-key": ANTHROPIC_API_KEY,
@@ -122,7 +138,9 @@ def translate_with_claude(text):
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         result = json.loads(resp.read().decode("utf-8"))
-    return "".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text").strip()
+    return "".join(
+        b.get("text", "") for b in result.get("content", []) if b.get("type") == "text"
+    ).strip()
 
 
 def translate(text):
@@ -138,73 +156,97 @@ def translate(text):
     return text
 
 
-def send_to_telegram(title, link, description):
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN yoki TELEGRAM_CHAT_ID topilmadi (Secrets sozlanganmi?)")
-
-    text = f"<b>{title}</b>"
-    desc = clean_html(description)
-    if desc:
-        # juda uzun bo'lmasin
-        if len(desc) > 400:
-            desc = desc[:400].rsplit(" ", 1)[0] + "..."
-        text += f"\n\n{desc}"
-    if link:
-        text += f"\n\n🔗 {link}"
-
-    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
+def _telegram_api(method, payload):
+    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        api_url, data=data, headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    req = urllib.request.Request(api_url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=25) as resp:
         result = json.loads(resp.read().decode("utf-8"))
     if not result.get("ok"):
         raise RuntimeError(f"Telegram xatoligi: {result}")
 
 
+def build_caption(title, description, limit):
+    text = f"<b>{title}</b>"
+    desc = clean_html(description)
+    if desc:
+        room = limit - len(text) - 4
+        if room > 20:
+            if len(desc) > room:
+                desc = desc[:room].rsplit(" ", 1)[0] + "..."
+            text += f"\n\n{desc}"
+    return text
+
+
+def send_to_telegram(title, description, image_url):
+    if not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN yoki TELEGRAM_CHAT_ID topilmadi (Secrets sozlanganmi?)")
+
+    if image_url:
+        caption = build_caption(title, description, limit=1024)
+        try:
+            _telegram_api("sendPhoto", {
+                "chat_id": CHAT_ID,
+                "photo": image_url,
+                "caption": caption,
+                "parse_mode": "HTML",
+            })
+            return
+        except Exception as e:
+            print(f"[OGOHLANTIRISH] Rasm bilan yuborib bo'lmadi, matn sifatida yuboriladi: {e}")
+
+    caption = build_caption(title, description, limit=4096)
+    _telegram_api("sendMessage", {
+        "chat_id": CHAT_ID,
+        "text": caption,
+        "parse_mode": "HTML",
+    })
+
+
 def main():
     if not FEEDS:
-        print("Diqqat: FEEDS ro'yxati bo'sh. rss_to_telegram.py faylida FEEDS ni to'ldiring.")
+        print("Diqqat: FEEDS ro'yxati bo'sh.")
         return
 
     posted = load_posted()
-    new_posted = set(posted)
-    total_sent = 0
+    state = load_state()
+    n = len(FEEDS)
+    start_idx = state.get("next_feed_index", 0) % n
 
-    for feed_url in FEEDS:
+    sent = False
+    for offset in range(n):
+        idx = (start_idx + offset) % n
+        feed_url = FEEDS[idx]
         try:
             items = fetch_feed_items(feed_url)
         except Exception as e:
             print(f"[XATO] {feed_url} dan o'qib bo'lmadi: {e}")
             continue
 
-        # Eskisidan yangisiga qarab yuboramiz (RSS odatda yangisi tepada bo'ladi, shu uchun teskari aylantiramiz)
         for it in reversed(items):
-            if total_sent >= MAX_POSTS_PER_RUN:
-                break
             uid = item_id(it["link"], it["title"])
             if uid in posted:
                 continue
             try:
                 title = translate(it["title"])
                 description = translate(clean_html(it["description"]))
-                send_to_telegram(title, it["link"], description)
-                print(f"[OK] Yuborildi: {title}")
-                new_posted.add(uid)
-                total_sent += 1
-                time.sleep(2)  # Telegram limitiga urilmaslik uchun kichik pauza
+                send_to_telegram(title, description, it["image"])
+                posted.add(uid)
+                print(f"[OK] Yuborildi ({feed_url}): {title}")
+                sent = True
             except Exception as e:
                 print(f"[XATO] Yuborib bo'lmadi ({it['title']}): {e}")
+            break
+        if sent:
+            state["next_feed_index"] = (idx + 1) % n
+            break
 
-    save_posted(new_posted)
-    print(f"Jami yuborilgan yangi xabarlar: {total_sent}")
+    if not sent:
+        print("Yangi xabar topilmadi.")
+        state["next_feed_index"] = (start_idx + 1) % n
+
+    save_posted(posted)
+    save_state(state)
 
 
 if __name__ == "__main__":
