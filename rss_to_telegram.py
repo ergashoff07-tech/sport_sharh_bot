@@ -26,8 +26,10 @@ FEEDS = [
     "https://www.espn.com/espn/rss/soccer/news",
 ]
 
-TRANSLATE_MODE = "google"   # "off" / "google" / "claude"
+# "off" / "google" / "claude"  (env orqali o'zgartirish mumkin, default: claude)
+TRANSLATE_MODE = os.environ.get("TRANSLATE_MODE", "claude")
 TARGET_LANGUAGE = "uz"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 SIMILARITY_THRESHOLD = 0.55
 
@@ -128,50 +130,73 @@ def translate_with_google(text):
         return MyMemoryTranslator(source="en-GB", target="uz-UZ").translate(text)
 
 
-def translate_with_claude(text):
-    if not text:
-        return text
+def translate_pair_with_claude(title, description):
+    """Sarlavha va matnni BITTA so'rovda tarjima qiladi (uslub bir xil chiqadi)."""
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("TRANSLATE_MODE='claude' uchun ANTHROPIC_API_KEY secret kerak")
-    api_url = "https://api.anthropic.com/v1/messages"
+
+    prompt = (
+        "Sen professional futbol jurnalisti va tarjimonisan. Quyidagi ingliz tilidagi "
+        "futbol yangiligini o'zbek tiliga (lotin alifbosida) tarjima qil.\n\n"
+        "Qoidalar:\n"
+        "- So'zma-so'z emas, ma'nosini tabiiy, ravon va jonli o'zbek tilida yetkaz, "
+        "go'yo o'zbek sport nashrida yozilgandek.\n"
+        "- Jamoa, o'yinchi, murabbiy, stadion va liga nomlarini asl holida (lotinchada) qoldir.\n"
+        "- Futbol atamalarini o'zbek muxlislari ishlatadigan shaklda yoz "
+        "(transfer, penalti, gol, hat-trick, derbi, dubl).\n"
+        "- Sarlavha qisqa va jozibali bo'lsin.\n"
+        "- Asl matnda yo'q ma'lumot qo'shma, hech narsani tushirib qoldirma.\n"
+        "- Faqat tarjimani qaytar, izoh yozma.\n"
+        "- Javob formati: avval sarlavha tarjimasi, keyin alohida qatorda ||| belgisi, "
+        "keyin matn tarjimasi.\n\n"
+        f"SARLAVHA:\n{title}\n\nMATN:\n{description or '(matn yo`q)'}"
+    )
     payload = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 1000,
-        "messages": [{
-            "role": "user",
-            "content": (
-                "Quyidagi matnni o'zbek tiliga (lotin alifbosida) tabiiy va ravon "
-                "tarjima qil. Faqat tarjimani qaytar, boshqa hech narsa yozma:\n\n" + text
-            ),
-        }],
+        "model": CLAUDE_MODEL,
+        "max_tokens": 1500,
+        "messages": [{"role": "user", "content": prompt}],
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        api_url, data=data,
+        "https://api.anthropic.com/v1/messages", data=data,
         headers={
             "Content-Type": "application/json",
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=40) as resp:
         result = json.loads(resp.read().decode("utf-8"))
-    return "".join(
+    text = "".join(
         b.get("text", "") for b in result.get("content", []) if b.get("type") == "text"
     ).strip()
 
+    if "|||" in text:
+        t, d = text.split("|||", 1)
+        return t.strip(), (d.strip() if description else "")
+    if not description:
+        return text, ""
+    raise RuntimeError("Claude javobi kutilgan formatda emas")
+
 
 def translate(text):
+    """Google orqali (yoki 'off' bo'lsa tarjimasiz) tarjima."""
     if TRANSLATE_MODE == "off" or not text:
         return text
     try:
-        if TRANSLATE_MODE == "google":
-            return translate_with_google(text)
-        elif TRANSLATE_MODE == "claude":
-            return translate_with_claude(text)
+        return translate_with_google(text)
     except Exception as e:
         print(f"[OGOHLANTIRISH] Tarjima qilinmadi, asl matn qoldirildi: {e}")
-    return text
+        return text
+
+
+def translate_pair(title, description):
+    if TRANSLATE_MODE == "claude":
+        try:
+            return translate_pair_with_claude(title, description)
+        except Exception as e:
+            print(f"[OGOHLANTIRISH] Claude tarjimasi ishlamadi, Google ishlatiladi: {e}")
+    return translate(title), translate(description)
 
 
 def _telegram_api(method, payload):
@@ -270,8 +295,7 @@ def main():
                 break
 
     try:
-        title = translate(anchor["title"])
-        description = translate(clean_html(anchor["description"]))
+        title, description = translate_pair(anchor["title"], clean_html(anchor["description"]))
         send_to_telegram(title, description, chosen_image)
         print(f"[OK] Yuborildi: {title}  (bu voqeani {len(cluster)} ta manba yozgan edi)")
     except Exception as e:
